@@ -1,14 +1,14 @@
-# dm_perforce
+# perforce
 
-Shared Perforce wrapper package for Python tools.
+Shared Perforce wrapper package for Python tools (forked from `dm_perforce` for JAM/Spark use).
 
 This package centralizes the Perforce helper logic that was previously vendored inside individual apps.
 
 ## Scope
 Current module:
-- `dm_perforce.perforce`
+- `perforce.perforce`
 
-Current public API comes from `src/dm_perforce/perforce.py` (re-exported by `dm_perforce.__init__`).
+Current public API comes from `src/perforce/perforce.py` (re-exported by `perforce.__init__`).
 
 ## Requirements
 - Python 3.11+
@@ -54,7 +54,7 @@ Additional classes:
 Resolve a depot path to local and sync latest:
 
 ```python
-import dm_perforce as p4
+import perforce as p4
 
 con = p4.connect(force=True, search_path="//depot/project/...")
 local_path = p4.P4File.get_local_file("//depot/project/file.txt")
@@ -64,7 +64,7 @@ p4.P4File.get_latest("//depot/project/file.txt")
 Check if a file exists in Perforce:
 
 ```python
-import dm_perforce as p4
+import perforce as p4
 
 state, info = p4.P4File.exists_in_p4("//depot/project/file.txt", include_add=True)
 ```
@@ -81,16 +81,4 @@ Artifacts are created in `dist/` and can be published from CI/GitHub release.
 
 ## Notes
 - This is currently an extracted wrapper and may be refactored into a smaller stable API.
-- Existing tools can migrate from `import perforce` to `import dm_perforce as perforce`.
-
-## GitHub Actions (wheel build)
-The repo includes `.github/workflows/build-wheel.yml`:
-- On push/PR: builds `sdist` + `wheel` and uploads `dist/*` as artifacts.
-- On `v*` tag push: creates a GitHub release and attaches built files.
-
-## UV install from release
-After tagging (for example `v0.1.0`), UV can install the release wheel directly:
-
-```powershell
-uv pip install "https://github.com/<owner>/dm_perforce/releases/download/v0.1.0/dm_perforce-0.1.0-py3-none-any.whl"
-```
+- Tools should `import perforce` directly.

@@ -18,7 +18,7 @@ except ImportError:
     P4API = None
 
 logging.basicConfig()
-log = logging.getLogger("dm_perforce")
+log = logging.getLogger("perforce")
 log.setLevel(logging.INFO)
 
 DEFAULT_COMMENT = "Perforce Check In"
@@ -1451,7 +1451,7 @@ class Workspace(object):
 
         """
         Example debug flow:
-        import dm_perforce as perforce
+        import perforce
         config_depot_path = "//.../pipeline_config.json"
         config_info = perforce.Workspace.find(config_depot_path)
         c = perforce.connect()
