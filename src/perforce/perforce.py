@@ -24,6 +24,14 @@ log.setLevel(logging.INFO)
 DEFAULT_COMMENT = "Perforce Check In"
 G_CON = None
 
+# Per-port negative cache so a hung/unreachable host doesn't get retried within the session.
+# Maps "port" -> reason string. Cleared by reset_connection_caches().
+_BAD_CONNECTIONS = {}
+
+# Seconds to wait before giving up on a single P4 connect attempt. Picked small enough that
+# a stale recent-connections list from another machine fails fast instead of stalling boot.
+_CONNECT_TIMEOUT_SECS = 3
+
 
 _ORIGINAL_P4_RUN = P4.P4.run
 
@@ -133,7 +141,52 @@ def new_connection(level=1):
     """
     p4 = P4.P4()
     p4.exception_level = level
+    try:
+        p4.api_level = getattr(p4, "api_level", None) or 0
+    except Exception:
+        pass
     return p4
+
+
+def _try_connect(p4, port_key=None):
+    """
+    Connect with a bounded wall-clock timeout. p4python's connect() can block at the TCP layer
+    for ~20s when a server is unreachable; this runs it in a worker thread and gives up after
+    _CONNECT_TIMEOUT_SECS, marking the port as bad so we skip it for the rest of the session.
+
+    Returns True on success, False on timeout/failure.
+    """
+    import threading
+
+    key = port_key or getattr(p4, "port", None)
+    if key and key in _BAD_CONNECTIONS:
+        return False
+
+    result = {"ok": False, "err": None}
+
+    def _do():
+        try:
+            p4.connect()
+            result["ok"] = True
+        except Exception as e:
+            result["err"] = e
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(_CONNECT_TIMEOUT_SECS)
+
+    if t.is_alive():
+        if key:
+            _BAD_CONNECTIONS[key] = "timeout"
+        log.debug(f"P4 connect timed out after {_CONNECT_TIMEOUT_SECS}s: {key}")
+        return False
+
+    if not result["ok"]:
+        if key:
+            _BAD_CONNECTIONS[key] = str(result["err"]) or "connect failed"
+        return False
+
+    return True
 
 
 def connection_info(con):
@@ -172,7 +225,8 @@ def _auto_configure_connection_for_path(path=None):
             p4.user = connection.get("P4USER")
             p4.client = connection.get("Workspace")
 
-            p4.connect()
+            if not _try_connect(p4, port_key=connection.get("PORT")):
+                continue
             try:
                 where_result = p4.run("where", path)
                 if where_result:
@@ -182,7 +236,10 @@ def _auto_configure_connection_for_path(path=None):
                     return connection
             except P4Exception:
                 pass
-            p4.disconnect()
+            try:
+                p4.disconnect()
+            except Exception:
+                pass
         except Exception as e:
             log.debug(f"Error testing connection {connection.get('PORT')} for path {path}: {str(e)}")
             continue
@@ -311,6 +368,7 @@ def reset_connection_caches():
         clear = getattr(fn, "cache_clear", None)
         if callable(clear):
             clear()
+    _BAD_CONNECTIONS.clear()
 
 
 @lru_cache()
@@ -365,15 +423,21 @@ def get_valid_p4_connections():
         p4.user = connection.get("P4USER")
         p4.client = connection.get("Workspace")
 
+        if not _try_connect(p4, port_key=connection.get("PORT")):
+            log.debug(f"Connection failed for {connection.get('PORT')}: skipped")
+            continue
         try:
-            p4.connect()
             p4.run("info")
             valid_connections.append(connection)
             log.debug(f"Valid connection found: {connection['PORT']}")
-            p4.disconnect()
         except Exception as e:
             log.debug(f"Connection failed for {connection.get('PORT')}: {str(e)}")
-            continue
+            _BAD_CONNECTIONS[connection.get("PORT")] = str(e)
+        finally:
+            try:
+                p4.disconnect()
+            except Exception:
+                pass
 
     if not valid_connections:
         log.warning("No valid P4 connections found. Check your network/VPN status.")
@@ -417,7 +481,8 @@ def find_matching_workspace(search_path):
         workspace_name = connection["Workspace"]
 
         try:
-            p4.connect()
+            if not _try_connect(p4, port_key=connection["PORT"]):
+                continue
             workspace = None
             try:
                 workspace = p4.fetch_client(workspace_name)
@@ -497,10 +562,12 @@ def find_matching_workspace(search_path):
     return matching_workspace, port
 
 
-def connect(client=None, force=False, search_path=None):
+def connect(client=None, force=False, search_path=None, raise_on_failure=False):
     """
-    returns a P4 connection
-    :return:
+    returns a P4 connection. By default returns a possibly-disconnected P4 instance rather than
+    raising — callers like JAM bootstrap should be able to fall back to a local cache when the
+    server is unreachable or P4PASSWD is unset. Pass raise_on_failure=True for the legacy
+    ConnectionError behavior.
     """
     global G_CON
     if all([G_CON, force is False]):
@@ -508,7 +575,7 @@ def connect(client=None, force=False, search_path=None):
             G_CON.port = os.environ.get("P4PORT", G_CON.port)
             G_CON.user = os.environ.get("P4USER", G_CON.user)
             G_CON.client = os.environ.get("P4CLIENT", G_CON.client)
-            G_CON.connect()
+            _try_connect(G_CON, port_key=G_CON.port)
         return G_CON
 
     G_CON = new_connection()
@@ -517,23 +584,22 @@ def connect(client=None, force=False, search_path=None):
 
     if search_path:
         success = auto_configure_connection(client, G_CON, search_path)
-        if not success:
-            # Retry once after cache clear in case VPN/network became available.
-            reset_connection_caches()
-            success = auto_configure_connection(client, G_CON, search_path)
+        # Skip the legacy retry-after-cache-clear: with the negative cache and timeouts the
+        # first pass is already authoritative; a second pass just doubles the boot stall.
     else:
         ws = client_from_here(connection=G_CON)
         success = True
 
     if not success:
-        raise ConnectionError(
-            "Could not connect to perforce : {}".format(connection_info(G_CON))
-        )
-    try:
-        if not G_CON.connected():
-            G_CON.connect()
-    except Exception as e:
-        log.exception(e)
+        if raise_on_failure:
+            raise ConnectionError(
+                "Could not connect to perforce : {}".format(connection_info(G_CON))
+            )
+        log.warning("Perforce unreachable; returning unconnected P4 instance")
+        return G_CON
+
+    if not G_CON.connected():
+        _try_connect(G_CON, port_key=getattr(G_CON, "port", None))
     return G_CON
 
 
